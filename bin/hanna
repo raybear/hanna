@@ -1,0 +1,14 @@
+#!/usr/bin/env node
+// This executable sets up the environment and runs the Hanna CLI.
+
+"use strict";
+
+process.title = "hanna";
+
+// Locate the Hanna Library
+const path  = require("path");
+const fs    = require("fs");
+const lib   = path.join(path.dirname(fs.realpathSync(__filename)), "../lib");
+
+// Run Hanna
+require(lib + '/hanna.cli')();

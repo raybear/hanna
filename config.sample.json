@@ -1,0 +1,22 @@
+{
+  "bridge": {
+    "name": "Hanna Bridge",
+    "username": "CC:22:3D:E3:CE:30",
+    "manufacturer": "Trilogy Enterprises, Inc.",
+    "model": "HB-11-2021",
+    "port": 51826,
+    "pin": "031-45-154"
+  },
+  "description": "This is an example configuration",
+  "ports": {
+    "start": 52100,
+    "end": 52150,
+    "comment": "This section is used to control the range of ports that separate accessory should be bind to."
+  },
+  "accessories": [
+    { "accessory": "WeMo", "name": "Coffee Maker" }
+  ],
+  "platforms": [
+    { "platform" : "PhilipsHue", "name" : "Hue" }
+  ]
+}

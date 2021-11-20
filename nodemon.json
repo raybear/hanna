@@ -1,0 +1,7 @@
+{
+  "watch": [ "src" ],
+  "ext": "ts",
+  "ignore": [ "src/**/*.spec.ts" ],
+  "exec": "tsc && bin/hanna -I -C",
+  "signal": "SIGTERM"
+}

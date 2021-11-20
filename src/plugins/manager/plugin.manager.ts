@@ -1,0 +1,393 @@
+import {Logger} from '../../services/logger.service';
+import {execSync} from 'child_process';
+import fs from 'fs';
+import path from 'path';
+
+import {PluginManagerOptions} from '../../options/plugin.options';
+import {
+  AccessoryIdentifier,
+  AccessoryName,
+  PlatformIdentifier,
+  PlatformName,
+  PluginIdentifier,
+  PluginName
+} from '../../declarations/hanna.type';
+import {InternalAPIEvent} from '../../events/internal-api.event';
+import {AccessoryPluginConstructor} from '../../interfaces/accessory-plugin.constructor';
+import {PlatformPluginConstructor} from '../../interfaces/platform-plugin.constructor';
+import {PackageJSON} from '../../models/package.model';
+import {HannaAPI} from '../../hanna.api';
+import {Plugin} from '../../plugins/plugin';
+
+const log = Logger.internal;
+
+/** Utility which exposes methods to search for installed Hanna plugins */
+export class PluginManager {
+  // name must be prefixed with 'hanna-' or '@scope/hanna-'
+  private static readonly _PLUGIN_IDENTIFIER_PATTERN = /^((@[\w-]*)\/)?(hanna-[\w-]*)$/;
+
+  private readonly _api: HannaAPI;
+
+  // unique set of search paths we will use to discover installed plugins
+  private readonly _searchPaths: Set<string> = new Set();
+  private readonly _activePlugins?: PluginIdentifier[];
+  private readonly _disabledPlugins?: PluginIdentifier[];
+
+  private readonly _plugins: Map<PluginIdentifier, Plugin> = new Map();
+  // We have some plugins which simply pass a wrong or misspelled plugin name to the api calls,
+  // this translation tries to mitigate this
+  private readonly _pluginIdentifierTranslation: Map<PluginIdentifier, PluginIdentifier> = new Map();
+  private readonly _accessoryToPluginMap: Map<AccessoryName, Plugin[]> = new Map();
+  private readonly _platformToPluginMap: Map<PlatformName, Plugin[]> = new Map();
+
+  // Used to match registering plugins, see handleRegisterAccessory and handleRegisterPlatform
+  private _currentInitializingPlugin?: Plugin;
+
+  constructor(api: HannaAPI, options?: PluginManagerOptions) {
+    this._api = api;
+
+    if(options) {
+      if (options.customPluginPath) {
+        this._searchPaths.add(path.resolve(process.cwd(), options.customPluginPath));
+      }
+
+      this._activePlugins = options.activePlugins;
+      this._disabledPlugins = Array.isArray(options.disabledPlugins) ? options.disabledPlugins : undefined;
+    }
+
+    this._api.on(InternalAPIEvent.REGISTER_ACCESSORY, this.handleRegisterAccessory.bind(this));
+    this._api.on(InternalAPIEvent.REGISTER_PLATFORM, this.handleRegisterPlatform.bind(this));
+  }
+
+  public static isQualifiedPluginIdentifier(identifier: string): boolean {
+    return PluginManager._PLUGIN_IDENTIFIER_PATTERN.test(identifier);
+  }
+
+  // extract plugin name without @scope/ prefix
+  public static extractPluginName(name: string): PluginName {
+    return name.match(PluginManager._PLUGIN_IDENTIFIER_PATTERN)![3];
+  }
+
+  // extract the "@scope" of a npm module name
+  public static extractPluginScope(name: string): string {
+    return name.match(PluginManager._PLUGIN_IDENTIFIER_PATTERN)![2];
+  }
+
+  public static getAccessoryName(identifier: AccessoryIdentifier): AccessoryName {
+    if (identifier.indexOf(".") === -1)
+      return identifier;
+    return identifier.split(".")[1];
+  }
+
+  public static getPlatformName(identifier: PlatformIdentifier): PlatformIdentifier {
+    if (identifier.indexOf(".") === -1)
+      return identifier;
+    return identifier.split(".")[1];
+  }
+
+  public static getPluginIdentifier(identifier: AccessoryIdentifier | PlatformIdentifier): PluginIdentifier {
+    return identifier.split(".")[0];
+  }
+
+  public initializeInstalledPlugins(): void {
+    log.info("---");
+    this.loadInstalledPlugins();
+    this._plugins.forEach((plugin: Plugin, identifier: PluginIdentifier) => {
+      try {
+        plugin.load();
+      } catch (error) {
+        log.error(`ERROR LOADING PLUGIN ${identifier}:`, error.stack);
+        this._plugins.delete(identifier);
+        return;
+      }
+
+      if (this._disabledPlugins && this._disabledPlugins.includes(plugin.getPluginIdentifier()))
+        plugin.disabled = true;
+
+      if (plugin.disabled) {
+        log.warn(`Disabled plugin: ${identifier}@${plugin.version}`);
+      } else {
+        log.info(`Loaded plugin: ${identifier}@${plugin.version}`);
+      }
+
+      this.initializePlugin(plugin, identifier);
+    });
+
+    this._currentInitializingPlugin = undefined;
+  }
+
+  public initializePlugin(plugin: Plugin, identifier: string): void {
+    try {
+      this._currentInitializingPlugin = plugin;
+      // Call the plugin's initializer and pass it our API instance
+      plugin.initialize(this._api);
+    } catch (error) {
+      log.error(`ERROR INITIALIZING PLUGIN ${identifier}:`, error.stack);
+      this._plugins.delete(identifier);
+      return;
+    }
+  }
+
+  private handleRegisterAccessory(name: AccessoryName, constructor: AccessoryPluginConstructor, pluginIdentifier?: PluginIdentifier): void {
+    if(!this._currentInitializingPlugin) {
+      throw new Error(`Unexpected accessory registration. Plugin ${pluginIdentifier? `'${pluginIdentifier}' `: ""}tried to register outside the initializer function!`);
+    }
+
+    if(pluginIdentifier && pluginIdentifier !== this._currentInitializingPlugin.getPluginIdentifier()) {
+      log.info(`Plugin '${this._currentInitializingPlugin.getPluginIdentifier()}' tried to register with an incorrect plugin identifier: '${pluginIdentifier}'. Please report this to the developer!`);
+      this._pluginIdentifierTranslation.set(pluginIdentifier, this._currentInitializingPlugin.getPluginIdentifier());
+    }
+
+    this._currentInitializingPlugin.registerAccessory(name, constructor);
+
+    let plugins = this._accessoryToPluginMap.get(name);
+    if (!plugins) {
+      plugins = [];
+      this._accessoryToPluginMap.set(name, plugins);
+    }
+    plugins.push(this._currentInitializingPlugin);
+  }
+
+  private handleRegisterPlatform(name: PlatformName, constructor: PlatformPluginConstructor, pluginIdentifier?: PluginIdentifier): void {
+    if (!this._currentInitializingPlugin) {
+      throw new Error(`Unexpected platform registration. Plugin ${pluginIdentifier? `'${pluginIdentifier}' `: ""}tried to register outside the initializer function!`);
+    }
+
+    if (pluginIdentifier && pluginIdentifier !== this._currentInitializingPlugin.getPluginIdentifier()) {
+      log.debug(`Plugin '${this._currentInitializingPlugin.getPluginIdentifier()}' tried to register with an incorrect plugin identifier: '${pluginIdentifier}'. Please report this to the developer!`);
+      this._pluginIdentifierTranslation.set(pluginIdentifier, this._currentInitializingPlugin.getPluginIdentifier());
+    }
+
+    this._currentInitializingPlugin.registerPlatform(name, constructor);
+
+    let plugins = this._platformToPluginMap.get(name);
+    if (!plugins) {
+      plugins = [];
+      this._platformToPluginMap.set(name, plugins);
+    }
+    plugins.push(this._currentInitializingPlugin);
+  }
+
+  public hasPluginRegistered(pluginIdentifier: PluginIdentifier): boolean {
+    return this._plugins.has(pluginIdentifier) || this._pluginIdentifierTranslation.has(pluginIdentifier);
+  }
+
+  public getPlugin(pluginIdentifier: PluginIdentifier): Plugin | undefined {
+    const plugin = this._plugins.get(pluginIdentifier);
+    if (plugin) return plugin;
+
+    const translation = this._pluginIdentifierTranslation.get(pluginIdentifier);
+    if (translation) return this._plugins.get(translation);
+    return undefined;
+  }
+
+  public getPluginForAccessory(accessoryIdentifier: AccessoryIdentifier | AccessoryName): Plugin {
+    let plugin: Plugin;
+    // See if it matches exactly one accessory
+    if (accessoryIdentifier.indexOf(".") === -1) {
+      let found = this._accessoryToPluginMap.get(accessoryIdentifier);
+
+      if (!found)
+        throw new Error(`No plugin was found for the accessory "${accessoryIdentifier}" in your config.json. Please make sure the corresponding plugin is installed correctly.`);
+
+      if (found.length > 1) {
+        const options = found.map(plugin => plugin.getPluginIdentifier() + "." + accessoryIdentifier).join(", ");
+        // check if only one of the multiple platforms is not disabled
+        found = found.filter(plugin => !plugin.disabled);
+        if (found.length !== 1)
+          throw new Error(`The requested accessory '${accessoryIdentifier}' has been registered multiple times. Please be more specific by writing one of: ${options}`);
+      }
+
+      plugin = found[0];
+      accessoryIdentifier = plugin.getPluginIdentifier() + "." + accessoryIdentifier;
+    } else {
+      const pluginIdentifier = PluginManager.getPluginIdentifier(accessoryIdentifier);
+      if (!this.hasPluginRegistered(pluginIdentifier))
+        throw new Error(`The requested plugin '${pluginIdentifier}' was not registered.`);
+      plugin = this.getPlugin(pluginIdentifier)!;
+    }
+
+    return plugin;
+  }
+
+  public getPluginForPlatform(platformIdentifier: PlatformIdentifier | PlatformName): Plugin {
+    let plugin: Plugin;
+    // See if it matches exactly one platform
+    if (platformIdentifier.indexOf(".") === -1) {
+      let found = this._platformToPluginMap.get(platformIdentifier);
+
+      if(!found)
+        throw new Error(`No plugin was found for the platform "${platformIdentifier}" in your config.json. Please make sure the corresponding plugin is installed correctly.`);
+
+      if (found.length > 1) {
+        const options = found.map(plugin => plugin.getPluginIdentifier() + "." + platformIdentifier).join(", ");
+        // check if only one of the multiple platforms is not disabled
+        found = found.filter(plugin => !plugin.disabled);
+        if (found.length !== 1)
+          throw new Error(`The requested platform '${platformIdentifier}' has been registered multiple times. Please be more specific by writing one of: ${options}`);
+      }
+
+      plugin = found[0];
+      platformIdentifier = plugin.getPluginIdentifier() + "." + platformIdentifier;
+    } else {
+      const pluginIdentifier = PluginManager.getPluginIdentifier(platformIdentifier);
+      if (!this.hasPluginRegistered(pluginIdentifier))
+        throw new Error(`The requested plugin '${pluginIdentifier}' was not registered.`);
+      plugin = this.getPlugin(pluginIdentifier)!;
+    }
+
+    return plugin;
+  }
+
+  public getPluginByActiveDynamicPlatform(platformName: PlatformName): Plugin | undefined {
+    const found = (this._platformToPluginMap.get(platformName) || [])
+      .filter(plugin => !!plugin.getActiveDynamicPlatform(platformName));
+
+    if (found.length === 0) {
+      return undefined;
+    } else if (found.length > 1) {
+      const plugins = found.map(plugin => plugin.getPluginIdentifier()).join(", ");
+      throw new Error(`'${platformName}' is an ambiguous platform name. It was registered by multiple plugins: ${plugins}`);
+    } else {
+      return found[0];
+    }
+  }
+
+  /** Gets all plugins installed on the local system */
+  private loadInstalledPlugins(): void {
+    this.loadDefaultPaths();
+
+    this._searchPaths.forEach(searchPath => { // search for plugins among all known paths
+      if (!fs.existsSync(searchPath)) { // just because this path is in require.main.paths doesn't mean it necessarily exists!
+        return;
+      }
+
+      if (fs.existsSync(path.join(searchPath, 'package.json'))) { // does this path point inside a single plugin and not a directory containing plugins?
+        try {
+          this.loadPlugin(searchPath);
+        } catch (error) {
+          log.warn(error.message);
+          return;
+        }
+      } else { // read through each directory in this node_modules folder
+        const relativePluginPaths = fs.readdirSync(searchPath) // search for directories only
+          .filter(relativePath => {
+            try {
+              return fs.statSync(path.resolve(searchPath, relativePath)).isDirectory();
+            } catch (e) {
+              log.debug(`Ignoring path ${path.resolve(searchPath, relativePath)} - ${e.message}`);
+              return false;
+            }
+          });
+
+        // expand out @scoped plugins
+        relativePluginPaths.slice()
+          .filter(path => path.charAt(0) === "@") // is it a scope directory?
+          .forEach(scopeDirectory => {
+            // remove scopeDirectory from the path list
+            const index = relativePluginPaths.indexOf(scopeDirectory);
+            relativePluginPaths.splice(index, 1);
+
+            const absolutePath = path.join(searchPath, scopeDirectory);
+            fs.readdirSync(absolutePath)
+              .filter(name => PluginManager.isQualifiedPluginIdentifier(name))
+              .filter(name => {
+                try {
+                  return fs.statSync(path.resolve(absolutePath, name)).isDirectory();
+                } catch (e) {
+                  log.debug(`Ignoring path ${path.resolve(absolutePath, name)} - ${e.message}`);
+                  return false;
+                }
+              })
+              .forEach(name => relativePluginPaths.push(scopeDirectory + "/" + name));
+          });
+
+        relativePluginPaths
+          .filter(pluginIdentifier => {
+            // Needs to be a valid Hanna plugin name
+            return PluginManager.isQualifiedPluginIdentifier(pluginIdentifier)
+              // Check if activePlugins is restricted and if so if the plugin is contained
+              && (!this._activePlugins || this._activePlugins.includes(pluginIdentifier));
+          })
+          .forEach(pluginIdentifier => {
+            try {
+              const absolutePath = path.resolve(searchPath, pluginIdentifier);
+              this.loadPlugin(absolutePath);
+            } catch (error) {
+              log.warn(error.message);
+              return;
+            }
+          });
+      }
+    });
+
+    if (this._plugins.size === 0)
+      log.warn("No plugins found. See the README for information on installing plugins.");
+  }
+
+  public loadPlugin(absolutePath: string): Plugin {
+    const packageJson: PackageJSON = PluginManager.loadPackageJSON(absolutePath);
+
+    const identifier: PluginIdentifier = packageJson.name;
+    const name: PluginName = PluginManager.extractPluginName(identifier);
+    const scope = PluginManager.extractPluginScope(identifier); // possibly undefined
+
+    // Check if there is already a plugin with the same Identifier
+    const alreadyInstalled = this._plugins.get(identifier);
+    if (alreadyInstalled)
+      throw new Error(`Warning: skipping plugin found at '${absolutePath}' since we already loaded the same plugin from '${alreadyInstalled.getPluginPath()}'.`);
+
+    const plugin = new Plugin(name, absolutePath, packageJson, scope);
+    this._plugins.set(identifier, plugin);
+    return plugin;
+  }
+
+  private static loadPackageJSON(pluginPath: string): PackageJSON {
+    const packageJsonPath = path.join(pluginPath, 'package.json');
+    let packageJson: PackageJSON;
+
+    if (!fs.existsSync(packageJsonPath))
+      throw new Error(`Plugin ${pluginPath} does not contain a package.json.`);
+
+    try {
+      packageJson = JSON.parse(fs.readFileSync(packageJsonPath, {encoding: "utf8"}));
+    } catch (err) {
+      throw new Error(`Plugin ${pluginPath} contains an invalid package.json. Error: ${err}`);
+    }
+
+    if (!packageJson.name || !PluginManager.isQualifiedPluginIdentifier(packageJson.name))
+      throw new Error(`Plugin ${pluginPath} does not have a package name that begins with 'hanna-' or '@scope/hanna-.`);
+
+    // Verify that it's tagged with the correct keyword
+    if (!packageJson.keywords || !packageJson.keywords.includes('hanna-plugin'))
+      throw new Error(`Plugin ${pluginPath} package.json does not contain the keyword 'hanna-plugin'.`);
+
+    return packageJson;
+  }
+
+  private loadDefaultPaths(): void {
+    if (require.main)
+      // Add the paths used by require()
+      require.main.paths.forEach(path => this._searchPaths.add(path));
+
+    // Adding global npm directories
+    // We tried using npm to get the global modules path, but it haven't work out
+    // because of bugs in the parsable implementation of `ls` command and mostly
+    // performance issues. So, we go with our best bet for now.
+    if (process.env.NODE_PATH) {
+      process.env.NODE_PATH
+        .split(path.delimiter)
+        .filter(path => !!path) // trim out empty values
+        .forEach(path => this._searchPaths.add(path));
+    } else {
+      // Default paths for each system
+      if (process.platform === "win32") {
+        this._searchPaths.add(path.join(process.env.APPDATA!, "npm/node_modules"));
+      } else {
+        this._searchPaths.add("/usr/local/lib/node_modules");
+        this._searchPaths.add("/usr/lib/node_modules");
+        this._searchPaths.add(execSync("/bin/echo -n \"$(npm --no-update-notifier -g prefix)/lib/node_modules\"").toString("utf8"));
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "name": "hanna",
+  "version": "1.0.0",
+  "description": "",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "author": "Milos Sretin",
+  "license": "ISC",
+  "scripts": {
+    "dev": "DEBUG=* ./bin/hanna -D -P sample-plugins/ || true",
+    "lint": "eslint 'src/**/*.{ts,json}'",
+    "build": "npm run clean && tsc",
+    "clean": "rimraf lib/",
+    "watch": "nodemon",
+    "prepublishOnly": "npm run build",
+    "postpublish": "npm run clean"
+  },
+  "bin": {
+    "hanna": "bin/hanna"
+  },
+  "engines": {
+    "node": ">=10"
+  },
+  "preferGlobal": true,
+  "files": [
+    "lib",
+    "bin",
+    "config.sample.json"
+  ],
+  "devDependencies": {
+    "@types/fs-extra": "^9.0.13",
+    "@types/node": "^16.11.6",
+    "@types/semver": "^7.3.9",
+    "nodemon": "^2.0.14",
+    "rimraf": "^3.0.2",
+    "ts-node": "^10.4.0",
+    "typescript": "^4.4.4"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^8.3.0",
+    "fs-extra": "^10.0.0",
+    "hap-nodejs": "^0.9.6",
+    "qrcode-terminal": "^0.12.0",
+    "semver": "^5.7.1"
+  }
+}

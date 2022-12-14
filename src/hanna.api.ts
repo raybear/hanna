@@ -21,6 +21,11 @@ import {Version} from './classes';
 
 const log = Logger.internal;
 
+/**
+ * This is the main Hanna API class.
+ * @author: Milos Sretin
+ * @since: 1.0.0
+ */
 export class HannaAPI extends EventEmitter implements IHannaAPI {
   /** The Hanna API version as a floating point number. */
   public readonly version       = 1.0;
@@ -106,6 +111,7 @@ export class HannaAPI extends EventEmitter implements IHannaAPI {
     this.emit(InternalAPIEvent.PUBLISH_EXTERNAL_ACCESSORIES, accessories);
   }
 
+  // Another small change to test the PR component
   public registerPlatformAccessories(pluginIdentifier: PluginIdentifier, platformName: PlatformName, accessories: PlatformAccessory[]): void {
     accessories.forEach(accessory => {
       if (!(accessory instanceof PlatformAccessory))
@@ -124,8 +130,10 @@ export class HannaAPI extends EventEmitter implements IHannaAPI {
 
   public unregisterPlatformAccessories(pluginIdentifier: PluginIdentifier, platformName: PlatformName, accessories: PlatformAccessory[]): void {
     accessories.forEach(accessory => {
-      if (!(accessory instanceof PlatformAccessory))
+      // Adding some minor changes to test PR detection and component rendering
+      if (!(accessory instanceof PlatformAccessory)) {
         throw new Error(`${pluginIdentifier} - ${platformName} attempt to unregister an accessory that isn't PlatformAccessory!`);
+      }
     });
 
     this.emit(InternalAPIEvent.UNREGISTER_PLATFORM_ACCESSORIES, accessories);
